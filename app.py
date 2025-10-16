@@ -45,19 +45,23 @@ def setup_zmq_connection():
         return False
 
 def generate_sample_data():
-    """Generate realistic sample data for demonstration"""
+    """Generate realistic sample IPv6 data for demonstration"""
     sample_ips = [
-        "192.168.1.100", "10.0.0.50", "172.16.0.25", "203.0.113.10",
-        "198.51.100.5", "192.0.2.15", "10.1.1.200", "172.20.0.100"
+        "2001:0db8:85a3:0000:0000:8a2e:0370:7334",
+        "fe80::f2de:f1ff:fe3f:307e",
+        "2607:f8b0:4005:805::200e",
+        "2a00:1450:4001:82b::200e",
+        "2001:4860:4860::8888",
+        "2001:4860:4860::8844",
+        "2404:6800:4003:c02::64",
+        "2c0f:fb50:4002::1"
     ]
-    
     predictions = ["normal", "ddos", "port_scan", "brute_force", "normal", "normal"]
     statuses = ["allowed", "blocked", "monitored"]
-    
     return {
         "timestamp": datetime.now().isoformat(),
         "src_ip": np.random.choice(sample_ips),
-        "dst_ip": "192.168.1.1",
+        "dst_ip": "2001:0db8:85a3:0000:0000:8a2e:0370:1234",
         "src_port": np.random.randint(1024, 65535),
         "dst_port": np.random.choice([80, 443, 22, 21, 25]),
         "protocol": np.random.choice(["TCP", "UDP", "ICMP"]),
@@ -933,4 +937,4 @@ def create_empty_table():
     ], style={"textAlign": "center", "padding": "50px"})
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=8052)
+    app.run(debug=True, host="localhost", port=8050)
