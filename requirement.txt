@@ -1,0 +1,33 @@
+# SDN DDoS Defense System - Python Dependencies
+
+# Core Framework
+ryu>=4.34
+dash>=2.14.0
+plotly>=5.17.0
+
+# ZeroMQ for Pub-Sub
+pyzmq>=25.1.0
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Machine Learning
+scikit-learn>=1.3.0
+joblib>=1.3.0
+
+# Additional Dashboard Components
+dash-bootstrap-components>=1.5.0
+
+# Data Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Optional: Enhanced features
+python-dateutil>=2.8.0
+pytz>=2023.3
+
+# Development Tools (optional)
+pytest>=7.4.0
+black>=23.0.0
+flake8>=6.0.0

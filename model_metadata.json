@@ -1,0 +1,20 @@
+{
+    "model_type": "RandomForestClassifier",
+    "n_estimators": 100,
+    "accuracy": 1.0,
+    "cv_score": 1.0,
+    "features": [
+        "packet_count",
+        "byte_count"
+    ],
+    "training_samples": 8000,
+    "test_samples": 2000,
+    "normal_threshold": {
+        "packet_count_max": 49,
+        "byte_count_max": 4999
+    },
+    "ddos_threshold": {
+        "packet_count_min": 50,
+        "byte_count_min": 5084
+    }
+}

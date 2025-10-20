@@ -1,7 +1,5 @@
 import dash
-from dash import dcc, html, dash_table, callback_context
-from dash.dependencies import Output, Input, State
-import plotly.express as px
+from dash import dcc, html, dash_table, Input, Output, State
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
@@ -11,926 +9,1174 @@ import threading
 from datetime import datetime, timedelta
 import numpy as np
 import time
-from collections import defaultdict, deque
-import socket as sock
+from collections import deque
 
-# Global traffic data store with better structure
-traffic_data = deque(maxlen=2000)  # Use deque for better performance
-stats_history = deque(maxlen=100)   # Store historical stats
-alert_queue = deque(maxlen=50)      # Store recent alerts
+# ========== CONFIGURATION ==========
+ZMQ_ADDRESS = "tcp://localhost:5555"
+MAX_EVENTS = 5000
+UPDATE_INTERVAL = 500  # ms
 
-# Real-time metrics
-current_stats = {
+# ========== GLOBAL DATA STORE ==========
+traffic_events = deque(maxlen=MAX_EVENTS)
+alert_queue = deque(maxlen=100)
+system_stats = {
     'total_requests': 0,
     'threats_detected': 0,
-    'blocked_ips': set(),
+    'blocked_count': 0,
     'avg_response_time': 0,
-    'bandwidth_usage': 0,
-    'active_connections': 0,
-    'last_update': datetime.now()
+    'total_bandwidth': 0,
+    'start_time': datetime.now(),
+    'last_event_time': None,
+    'connection_status': 'Connecting...'
 }
 
-# Setup ZeroMQ Subscriber with error handling
-context = zmq.Context()
-socket = context.socket(zmq.SUB)
+blocked_ips_set = set()
+is_paused = False
+zmq_connected = False
 
-def setup_zmq_connection():
+# ========== ZMQ SUBSCRIBER ==========
+def zmq_subscriber():
+    """Real-time ZMQ subscriber thread"""
+    global traffic_events, alert_queue, system_stats, blocked_ips_set, zmq_connected
+    
+    context = zmq.Context()
+    subscriber = context.socket(zmq.SUB)
+    
     try:
-        socket.connect("tcp://localhost:5555")
-        socket.setsockopt_string(zmq.SUBSCRIBE, "")
-        socket.setsockopt(zmq.RCVTIMEO, 1000)  # 1 second timeout
-        return True
+        subscriber.connect(ZMQ_ADDRESS)
+        subscriber.setsockopt_string(zmq.SUBSCRIBE, "")
+        subscriber.setsockopt(zmq.RCVTIMEO, 1000)
+        zmq_connected = True
+        system_stats['connection_status'] = 'Connected'
+        print(f"✅ Connected to ZMQ at {ZMQ_ADDRESS}")
     except Exception as e:
-        print(f"ZMQ Connection Error: {e}")
-        return False
-
-def generate_sample_data():
-    """Generate realistic sample data for demonstration"""
-    sample_ips = [
-        "192.168.1.100", "10.0.0.50", "172.16.0.25", "203.0.113.10",
-        "198.51.100.5", "192.0.2.15", "10.1.1.200", "172.20.0.100"
-    ]
-    
-    predictions = ["normal", "ddos", "port_scan", "brute_force", "normal", "normal"]
-    statuses = ["allowed", "blocked", "monitored"]
-    
-    return {
-        "timestamp": datetime.now().isoformat(),
-        "src_ip": np.random.choice(sample_ips),
-        "dst_ip": "192.168.1.1",
-        "src_port": np.random.randint(1024, 65535),
-        "dst_port": np.random.choice([80, 443, 22, 21, 25]),
-        "protocol": np.random.choice(["TCP", "UDP", "ICMP"]),
-        "packet_count": np.random.randint(1, 1000),
-        "byte_count": np.random.randint(64, 65536),
-        "duration": np.random.uniform(0.1, 10.0),
-        "prediction": np.random.choice(predictions, p=[0.7, 0.1, 0.08, 0.07, 0.025, 0.025]),
-        "confidence": np.random.uniform(0.7, 0.99),
-        "status": np.random.choice(statuses, p=[0.8, 0.15, 0.05]),
-        "threat_level": np.random.choice(["low", "medium", "high", "critical"], p=[0.6, 0.25, 0.1, 0.05]),
-        "response_time": np.random.uniform(1, 100)
-    }
-
-def listen_to_ryu():
-    """Enhanced listener with fallback to sample data"""
-    global traffic_data, current_stats, alert_queue
-    
-    zmq_connected = setup_zmq_connection()
+        print(f"❌ ZMQ Connection Failed: {e}")
+        zmq_connected = False
+        system_stats['connection_status'] = 'Disconnected'
+        return
     
     while True:
         try:
-            if zmq_connected:
-                try:
-                    msg = socket.recv_string(zmq.NOBLOCK)
-                    event = json.loads(msg)
-                except zmq.Again:
-                    # No message received, generate sample data
-                    event = generate_sample_data()
-                    time.sleep(0.5)  # Simulate realistic timing
-                except Exception as e:
-                    print(f"ZMQ receive error: {e}")
-                    event = generate_sample_data()
-                    time.sleep(0.5)
-            else:
-                # Use sample data if ZMQ not connected
-                event = generate_sample_data()
-                time.sleep(0.5)
-            
-            # Ensure timestamp is present
-            if 'timestamp' not in event:
-                event['timestamp'] = datetime.now().isoformat()
-            
-            # Add derived fields
-            event['flow_rate'] = event.get('packet_count', 0) / max(event.get('duration', 0.1), 0.1)
-            
-            traffic_data.append(event)
-            
-            # Update real-time stats
-            current_stats['total_requests'] += 1
-            if event.get('prediction', 'normal') != 'normal':
-                current_stats['threats_detected'] += 1
-            
-            if event.get('status') == 'blocked':
-                current_stats['blocked_ips'].add(event.get('src_ip', ''))
-            
-            current_stats['avg_response_time'] = event.get('response_time', 0)
-            current_stats['bandwidth_usage'] += event.get('byte_count', 0)
-            current_stats['last_update'] = datetime.now()
-            
-            # Generate alerts for high-priority threats
-            if event.get('threat_level') in ['high', 'critical'] or event.get('prediction') in ['ddos', 'brute_force']:
-                alert = {
-                    'timestamp': event['timestamp'],
-                    'type': event.get('prediction', 'unknown'),
-                    'src_ip': event.get('src_ip', 'unknown'),
-                    'severity': event.get('threat_level', 'medium'),
-                    'message': f"{event.get('prediction', 'Threat').title()} detected from {event.get('src_ip', 'unknown IP')}"
-                }
-                alert_queue.append(alert)
+            if not is_paused:
+                message = subscriber.recv_string(flags=zmq.NOBLOCK)
+                event = json.loads(message)
                 
+                traffic_events.append(event)
+                system_stats['total_requests'] += 1
+                system_stats['last_event_time'] = datetime.now()
+                
+                if event.get('prediction') != 'normal':
+                    system_stats['threats_detected'] += 1
+                
+                if event.get('status') == 'blocked':
+                    system_stats['blocked_count'] += 1
+                    blocked_ips_set.add(event.get('src_ip'))
+                
+                system_stats['avg_response_time'] = event.get('response_time', 0)
+                system_stats['total_bandwidth'] += event.get('byte_count', 0)
+                
+                if event.get('threat_level') in ['high', 'critical']:
+                    alert = {
+                        'timestamp': event['timestamp'],
+                        'type': event.get('prediction', 'threat'),
+                        'src_ip': event.get('src_ip'),
+                        'severity': event.get('threat_level'),
+                        'message': f"{event.get('prediction', 'unknown').upper()}: {event.get('src_ip')} → {event.get('dst_ip')}:{event.get('dst_port')}"
+                    }
+                    alert_queue.append(alert)
+                    print(f"🚨 ALERT: {alert['message']}")
+                
+                zmq_connected = True
+                system_stats['connection_status'] = 'Connected'
+                
+        except zmq.Again:
+            time.sleep(0.01)
         except Exception as e:
-            print(f"Listener error: {e}")
+            print(f"⚠️ Subscriber error: {e}")
+            zmq_connected = False
+            system_stats['connection_status'] = 'Error'
             time.sleep(1)
 
-# Start listener thread
-threading.Thread(target=listen_to_ryu, daemon=True).start()
+# Start subscriber thread
+subscriber_thread = threading.Thread(target=zmq_subscriber, daemon=True)
+subscriber_thread.start()
 
-# Initialize Dash app with custom CSS
-app = dash.Dash(__name__)
-app.title = "Advanced SDN DDoS Defense Dashboard"
+# ========== DASH APP ==========
+app = dash.Dash(__name__, suppress_callback_exceptions=True)
+app.title = "SDN DDoS Defense - Real-Time Monitor"
 
-# Custom CSS and JavaScript
+# Enhanced Modern CSS
 app.index_string = '''
 <!DOCTYPE html>
 <html>
-    <head>
-        {%metas%}
-        <title>{%title%}</title>
-        {%favicon%}
-        {%css%}
-        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
-        <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-        <style>
-            body { 
-                margin: 0; 
-                font-family: 'Poppins', sans-serif !important; 
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                min-height: 100vh;
+<head>
+    {%metas%}
+    <title>{%title%}</title>
+    {%favicon%}
+    {%css%}
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body { 
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: #0a0e27;
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+        
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: 
+                radial-gradient(circle at 20% 50%, rgba(120, 119, 198, 0.15) 0%, transparent 50%),
+                radial-gradient(circle at 80% 80%, rgba(99, 102, 241, 0.15) 0%, transparent 50%),
+                radial-gradient(circle at 40% 20%, rgba(139, 92, 246, 0.1) 0%, transparent 50%);
+            z-index: -1;
+            animation: bgShift 20s ease infinite;
+        }
+        
+        @keyframes bgShift {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.8; transform: scale(1.1); }
+        }
+        
+        .header-bar {
+            background: linear-gradient(135deg, rgba(17, 24, 39, 0.95) 0%, rgba(31, 41, 55, 0.95) 100%);
+            backdrop-filter: blur(20px) saturate(180%);
+            border-bottom: 1px solid rgba(99, 102, 241, 0.2);
+            padding: 28px 40px;
+            margin-bottom: 32px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+        }
+        
+        .header-content {
+            max-width: 1600px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 20px;
+        }
+        
+        .header-title {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+        
+        .header-title h1 {
+            font-size: 2rem;
+            font-weight: 800;
+            background: linear-gradient(135deg, #60a5fa 0%, #a78bfa 50%, #ec4899 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            letter-spacing: -0.5px;
+        }
+        
+        .header-icon {
+            font-size: 2.5rem;
+            color: #60a5fa;
+            filter: drop-shadow(0 0 10px rgba(96, 165, 250, 0.5));
+            animation: pulse 3s ease-in-out infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+        }
+        
+        .header-status {
+            display: flex;
+            align-items: center;
+            gap: 24px;
+        }
+        
+        .main-container {
+            max-width: 1600px;
+            margin: 0 auto;
+            padding: 0 24px 40px;
+        }
+        
+        .control-panel {
+            background: linear-gradient(135deg, rgba(17, 24, 39, 0.8) 0%, rgba(31, 41, 55, 0.8) 100%);
+            backdrop-filter: blur(10px);
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 32px;
+            border: 1px solid rgba(99, 102, 241, 0.2);
+            box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+        }
+        
+        .control-buttons {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+        
+        .btn-modern {
+            padding: 12px 28px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            border: none;
+            border-radius: 10px;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .btn-modern:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+        }
+        
+        .btn-modern:active {
+            transform: translateY(0);
+        }
+        
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 24px;
+            margin-bottom: 32px;
+        }
+        
+        .metric-card {
+            background: linear-gradient(135deg, rgba(17, 24, 39, 0.9) 0%, rgba(31, 41, 55, 0.9) 100%);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 28px;
+            position: relative;
+            overflow: hidden;
+            border: 1px solid rgba(99, 102, 241, 0.2);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        
+        .metric-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 4px;
+            background: linear-gradient(90deg, var(--card-color), transparent);
+        }
+        
+        .metric-card:hover {
+            transform: translateY(-8px) scale(1.02);
+            box-shadow: 0 12px 48px rgba(0, 0, 0, 0.4);
+            border-color: var(--card-color);
+        }
+        
+        .metric-icon {
+            font-size: 3rem;
+            margin-bottom: 16px;
+            opacity: 0.9;
+            filter: drop-shadow(0 4px 8px rgba(0, 0, 0, 0.3));
+        }
+        
+        .metric-value {
+            font-size: 3rem;
+            font-weight: 900;
+            line-height: 1;
+            margin: 16px 0 12px;
+            color: var(--card-color);
+            text-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+        }
+        
+        .metric-label {
+            font-size: 0.875rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            color: rgba(255, 255, 255, 0.6);
+        }
+        
+        .chart-card {
+            background: linear-gradient(135deg, rgba(17, 24, 39, 0.9) 0%, rgba(31, 41, 55, 0.9) 100%);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 28px;
+            margin-bottom: 24px;
+            border: 1px solid rgba(99, 102, 241, 0.2);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            transition: transform 0.2s ease;
+        }
+        
+        .chart-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+        }
+        
+        .chart-title {
+            font-size: 1.25rem;
+            font-weight: 700;
+            color: #e5e7eb;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding-bottom: 16px;
+            border-bottom: 2px solid rgba(99, 102, 241, 0.2);
+        }
+        
+        .chart-title i {
+            color: #60a5fa;
+            filter: drop-shadow(0 2px 4px rgba(96, 165, 250, 0.3));
+        }
+        
+        .alert-high, .alert-critical {
+            border-radius: 12px;
+            padding: 20px;
+            margin: 12px 0;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+            animation: slideInRight 0.4s ease-out;
+            backdrop-filter: blur(10px);
+        }
+        
+        .alert-high {
+            background: linear-gradient(135deg, rgba(239, 68, 68, 0.9) 0%, rgba(220, 38, 38, 0.9) 100%);
+            border: 1px solid rgba(239, 68, 68, 0.5);
+            color: white;
+        }
+        
+        .alert-critical {
+            background: linear-gradient(135deg, rgba(220, 38, 38, 0.95) 0%, rgba(185, 28, 28, 0.95) 100%);
+            border: 1px solid rgba(220, 38, 38, 0.6);
+            color: white;
+            animation: pulseAlert 1.5s infinite, slideInRight 0.4s ease-out;
+        }
+        
+        @keyframes pulseAlert {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.85; transform: scale(0.98); }
+        }
+        
+        @keyframes slideInRight {
+            from { opacity: 0; transform: translateX(30px); }
+            to { opacity: 1; transform: translateX(0); }
+        }
+        
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 8px;
+            animation: statusPulse 2s infinite;
+        }
+        
+        .status-connected {
+            background: #10b981;
+            box-shadow: 0 0 12px rgba(16, 185, 129, 0.6);
+        }
+        
+        .status-disconnected {
+            background: #ef4444;
+            box-shadow: 0 0 12px rgba(239, 68, 68, 0.6);
+        }
+        
+        @keyframes statusPulse {
+            0%, 100% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.3); opacity: 0.7; }
+        }
+        
+        .live-indicator {
+            display: inline-flex;
+            align-items: center;
+            background: rgba(16, 185, 129, 0.15);
+            padding: 8px 16px;
+            border-radius: 24px;
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            font-weight: 600;
+            color: #10b981;
+        }
+        
+        .live-indicator::before {
+            content: '●';
+            color: #10b981;
+            font-size: 1.2rem;
+            margin-right: 8px;
+            animation: blink 1.5s infinite;
+        }
+        
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+        
+        .blocked-port-card {
+            background: linear-gradient(135deg, rgba(239, 68, 68, 0.1) 0%, rgba(220, 38, 38, 0.1) 100%);
+            border: 2px solid rgba(239, 68, 68, 0.5);
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 16px;
+            box-shadow: 0 4px 16px rgba(239, 68, 68, 0.2);
+            transition: all 0.3s ease;
+            animation: slideInUp 0.4s ease-out;
+        }
+        
+        @keyframes slideInUp {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .blocked-port-card:hover {
+            transform: translateX(4px);
+            box-shadow: 0 6px 24px rgba(239, 68, 68, 0.3);
+            background: linear-gradient(135deg, rgba(239, 68, 68, 0.15) 0%, rgba(220, 38, 38, 0.15) 100%);
+        }
+        
+        .badge {
+            display: inline-block;
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        .badge-critical {
+            background: linear-gradient(135deg, #dc2626, #991b1b);
+            color: white;
+            box-shadow: 0 4px 12px rgba(220, 38, 38, 0.4);
+        }
+        
+        .badge-blocked {
+            background: linear-gradient(135deg, #ef4444, #dc2626);
+            color: white;
+        }
+        
+        .filter-button-group {
+            display: inline-flex;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+            border: 1px solid rgba(99, 102, 241, 0.2);
+        }
+        
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: rgba(255, 255, 255, 0.5);
+        }
+        
+        .empty-state i {
+            font-size: 4rem;
+            margin-bottom: 20px;
+            opacity: 0.4;
+        }
+        
+        .empty-state h4 {
+            color: rgba(255, 255, 255, 0.7);
+            font-size: 1.25rem;
+            margin-top: 16px;
+            font-weight: 700;
+        }
+        
+        .empty-state p {
+            color: rgba(255, 255, 255, 0.5);
+            margin-top: 8px;
+        }
+        
+        .grid-2col {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 24px;
+        }
+        
+        .grid-65-35 {
+            display: grid;
+            grid-template-columns: 65fr 35fr;
+            gap: 24px;
+        }
+        
+        @media (max-width: 1200px) {
+            .grid-2col, .grid-65-35 {
+                grid-template-columns: 1fr;
             }
-            .metric-card {
-                background: linear-gradient(135deg, #fff 0%, #f8f9ff 100%);
-                border-radius: 15px;
-                padding: 25px;
-                box-shadow: 0 10px 30px rgba(0,0,0,0.1);
-                border: 1px solid rgba(255,255,255,0.2);
-                transition: transform 0.3s ease, box-shadow 0.3s ease;
-                position: relative;
-                overflow: hidden;
+        }
+        
+        @media (max-width: 768px) {
+            .header-content {
+                flex-direction: column;
+                text-align: center;
             }
-            .metric-card:hover {
-                transform: translateY(-5px);
-                box-shadow: 0 15px 35px rgba(0,0,0,0.15);
-            }
-            .metric-card::before {
-                content: '';
-                position: absolute;
-                top: 0;
-                left: 0;
-                right: 0;
-                height: 4px;
-                background: linear-gradient(90deg, #667eea, #764ba2);
-            }
-            .chart-container {
-                background: rgba(255,255,255,0.95);
-                backdrop-filter: blur(10px);
-                border-radius: 20px;
-                padding: 30px;
-                box-shadow: 0 15px 35px rgba(0,0,0,0.1);
-                border: 1px solid rgba(255,255,255,0.2);
-                margin-bottom: 25px;
-            }
-            .alert-item {
-                background: linear-gradient(135deg, #ff6b6b 0%, #ee5a24 100%);
-                color: white;
-                padding: 15px;
-                border-radius: 10px;
-                margin: 8px 0;
-                box-shadow: 0 5px 15px rgba(255,107,107,0.3);
-                animation: slideIn 0.5s ease-out;
-            }
-            @keyframes slideIn {
-                from { opacity: 0; transform: translateX(-20px); }
-                to { opacity: 1; transform: translateX(0); }
-            }
-            .status-indicator {
-                display: inline-block;
-                width: 12px;
-                height: 12px;
-                border-radius: 50%;
-                margin-right: 8px;
-                animation: pulse 2s infinite;
-            }
-            @keyframes pulse {
-                0% { transform: scale(1); }
-                50% { transform: scale(1.1); }
-                100% { transform: scale(1); }
-            }
-            .header-gradient {
-                background: linear-gradient(135deg, #2c3e50 0%, #3498db 50%, #9b59b6 100%);
-                position: relative;
-                overflow: hidden;
-            }
-            .header-gradient::before {
-                content: '';
-                position: absolute;
-                top: 0;
-                left: -100%;
+            
+            .control-buttons {
+                flex-direction: column;
                 width: 100%;
-                height: 100%;
-                background: linear-gradient(90deg, transparent, rgba(255,255,255,0.1), transparent);
-                animation: shine 3s infinite;
             }
-            @keyframes shine {
-                0% { left: -100%; }
-                100% { left: 100%; }
+            
+            .btn-modern {
+                width: 100%;
+                justify-content: center;
             }
-        </style>
-    </head>
-    <body>
-        {%app_entry%}
-        <footer>
-            {%config%}
-            {%scripts%}
-            {%renderer%}
-        </footer>
-    </body>
+        }
+        
+        ::-webkit-scrollbar {
+            width: 10px;
+            height: 10px;
+        }
+        
+        ::-webkit-scrollbar-track {
+            background: rgba(17, 24, 39, 0.5);
+            border-radius: 10px;
+        }
+        
+        ::-webkit-scrollbar-thumb {
+            background: linear-gradient(135deg, #60a5fa, #a78bfa);
+            border-radius: 10px;
+        }
+        
+        ::-webkit-scrollbar-thumb:hover {
+            background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+        }
+        
+        .dash-table-container {
+            border-radius: 12px;
+            overflow: hidden;
+        }
+        
+        .dash-table-container .dash-spreadsheet-container {
+            max-height: 600px;
+        }
+    </style>
+</head>
+<body>
+    {%app_entry%}
+    <footer>
+        {%config%}
+        {%scripts%}
+        {%renderer%}
+    </footer>
+</body>
 </html>
 '''
 
-# Enhanced Layout
+# ========== LAYOUT ==========
 app.layout = html.Div([
-    # Header with live status
     html.Div([
         html.Div([
             html.Div([
-                html.H1([
-                    html.I(className="fas fa-shield-halved", style={"marginRight": "15px", "color": "#00d4ff"}),
-                    "Advanced SDN DDoS Defense Center"
-                ], style={
-                    "color": "#fff", 
-                    "margin": "0", 
-                    "fontSize": "3rem",
-                    "fontWeight": "700",
-                    "textShadow": "0 2px 4px rgba(0,0,0,0.3)"
-                }),
-                html.Div([
-                    html.Span([
-                        html.Span(className="status-indicator", 
-                                style={"backgroundColor": "#00ff88"}),
-                        "System Online"
-                    ], style={"marginRight": "30px", "fontSize": "1.1rem"}),
-                    html.Span([
-                        html.I(className="fas fa-clock", style={"marginRight": "5px"}),
-                        html.Span(id="live-time")
-                    ], style={"fontSize": "1.1rem"})
-                ], style={
-                    "color": "#e8f4fd", 
-                    "marginTop": "10px",
-                    "display": "flex",
-                    "alignItems": "center",
-                    "justifyContent": "center"
-                })
-            ], style={"textAlign": "center"})
-        ])
-    ], className="header-gradient", style={
-        "padding": "40px 20px",
-        "marginBottom": "30px"
-    }),
-
-    # Auto-refresh components
-    dcc.Interval(id="update-interval", interval=1500, n_intervals=0),
-    dcc.Interval(id="time-interval", interval=1000, n_intervals=0),
-
-    # Real-time Metrics Dashboard
-    html.Div([
-        # Top Metrics Row
-        html.Div([
+                html.I(className="fas fa-shield-virus header-icon"),
+                html.H1("SDN DDoS Defense System")
+            ], className='header-title'),
+            
             html.Div([
+                html.Div(id='connection-status', className='live-indicator'),
                 html.Div([
-                    html.I(className="fas fa-network-wired", 
-                          style={"fontSize": "2.5rem", "color": "#4CAF50", "marginBottom": "10px"}),
-                    html.H2(id="total-requests", children="0", 
-                           style={"color": "#4CAF50", "margin": "0", "fontSize": "2.5rem", "fontWeight": "700"}),
-                    html.P("Total Requests", style={"margin": "5px 0", "color": "#666", "fontSize": "1.1rem"}),
-                    html.Small(id="request-rate", children="0 req/s", 
-                              style={"color": "#888", "fontSize": "0.9rem"})
-                ], className="metric-card", style={"textAlign": "center"})
-            ], className="three columns"),
-
-            html.Div([
-                html.Div([
-                    html.I(className="fas fa-exclamation-triangle", 
-                          style={"fontSize": "2.5rem", "color": "#FF5722", "marginBottom": "10px"}),
-                    html.H2(id="threats-detected", children="0", 
-                           style={"color": "#FF5722", "margin": "0", "fontSize": "2.5rem", "fontWeight": "700"}),
-                    html.P("Threats Detected", style={"margin": "5px 0", "color": "#666", "fontSize": "1.1rem"}),
-                    html.Small(id="threat-rate", children="0%", 
-                              style={"color": "#888", "fontSize": "0.9rem"})
-                ], className="metric-card", style={"textAlign": "center"})
-            ], className="three columns"),
-
-            html.Div([
-                html.Div([
-                    html.I(className="fas fa-ban", 
-                          style={"fontSize": "2.5rem", "color": "#FF9800", "marginBottom": "10px"}),
-                    html.H2(id="blocked-ips", children="0", 
-                           style={"color": "#FF9800", "margin": "0", "fontSize": "2.5rem", "fontWeight": "700"}),
-                    html.P("Blocked IPs", style={"margin": "5px 0", "color": "#666", "fontSize": "1.1rem"}),
-                    html.Small(id="block-rate", children="0% blocked", 
-                              style={"color": "#888", "fontSize": "0.9rem"})
-                ], className="metric-card", style={"textAlign": "center"})
-            ], className="three columns"),
-
-            html.Div([
-                html.Div([
-                    html.I(className="fas fa-tachometer-alt", 
-                          style={"fontSize": "2.5rem", "color": "#2196F3", "marginBottom": "10px"}),
-                    html.H2(id="avg-response", children="0ms", 
-                           style={"color": "#2196F3", "margin": "0", "fontSize": "2.5rem", "fontWeight": "700"}),
-                    html.P("Response Time", style={"margin": "5px 0", "color": "#666", "fontSize": "1.1rem"}),
-                    html.Small(id="bandwidth", children="0 MB/s", 
-                              style={"color": "#888", "fontSize": "0.9rem"})
-                ], className="metric-card", style={"textAlign": "center"})
-            ], className="three columns"),
-        ], className="row", style={"marginBottom": "30px"}),
-
-        # Main Analytics Row
-        html.Div([
-            # Real-time Traffic Flow
-            html.Div([
-                html.Div([
-                    html.H3([
-                        html.I(className="fas fa-chart-line", style={"marginRight": "10px", "color": "#667eea"}),
-                        "Real-time Traffic Analysis"
-                    ], style={"color": "#333", "marginBottom": "20px", "fontSize": "1.5rem", "fontWeight": "600"}),
-                    dcc.Graph(id="traffic-flow", style={"height": "450px"})
-                ], className="chart-container")
-            ], className="eight columns"),
-
-            # Live Alerts Panel
-            html.Div([
-                html.Div([
-                    html.H3([
-                        html.I(className="fas fa-bell", style={"marginRight": "10px", "color": "#ff6b6b"}),
-                        "Live Security Alerts"
-                    ], style={"color": "#333", "marginBottom": "20px", "fontSize": "1.5rem", "fontWeight": "600"}),
-                    html.Div(id="live-alerts", style={"maxHeight": "400px", "overflowY": "auto"})
-                ], className="chart-container")
-            ], className="four columns"),
-        ], className="row", style={"marginBottom": "30px"}),
-
-        # Network Topology and Threat Analysis
-        html.Div([
-            html.Div([
-                html.Div([
-                    html.H3([
-                        html.I(className="fas fa-project-diagram", style={"marginRight": "10px", "color": "#9c88ff"}),
-                        "Network Topology & Attack Vectors"
-                    ], style={"color": "#333", "marginBottom": "20px", "fontSize": "1.5rem", "fontWeight": "600"}),
-                    dcc.Graph(id="network-topology", style={"height": "400px"})
-                ], className="chart-container")
-            ], className="six columns"),
-
-            html.Div([
-                html.Div([
-                    html.H3([
-                        html.I(className="fas fa-crosshairs", style={"marginRight": "10px", "color": "#ff6348"}),
-                        "Attack Pattern Analysis"
-                    ], style={"color": "#333", "marginBottom": "20px", "fontSize": "1.5rem", "fontWeight": "600"}),
-                    dcc.Graph(id="attack-patterns", style={"height": "400px"})
-                ], className="chart-container")
-            ], className="six columns"),
-        ], className="row", style={"marginBottom": "30px"}),
-
-        # Performance Metrics
-        html.Div([
-            html.Div([
-                html.Div([
-                    html.H3([
-                        html.I(className="fas fa-server", style={"marginRight": "10px", "color": "#5f27cd"}),
-                        "System Performance Metrics"
-                    ], style={"color": "#333", "marginBottom": "20px", "fontSize": "1.5rem", "fontWeight": "600"}),
-                    dcc.Graph(id="performance-metrics", style={"height": "350px"})
-                ], className="chart-container")
-            ], className="twelve columns"),
-        ], className="row", style={"marginBottom": "30px"}),
-
-        # Detailed Events Table
-        html.Div([
-            html.Div([
-                html.H3([
-                    html.I(className="fas fa-table", style={"marginRight": "10px", "color": "#00cec9"}),
-                    "Network Security Events Log"
-                ], style={"color": "#333", "marginBottom": "20px", "fontSize": "1.5rem", "fontWeight": "600"}),
-                html.Div([
-                    html.Button("Export Data", id="export-btn", className="btn", 
-                               style={
-                                   "background": "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
-                                   "color": "white", "border": "none", "padding": "10px 20px",
-                                   "borderRadius": "8px", "marginBottom": "15px", "cursor": "pointer"
-                               }),
-                    html.Div(id="events-table")
-                ])
-            ], className="chart-container")
-        ], style={"marginBottom": "30px"}),
-    ], style={"padding": "0 20px"}),
-
-    # Footer
+                    html.I(className="fas fa-clock", style={'marginRight': '8px', 'color': '#60a5fa'}),
+                    html.Span(id='live-clock', style={'color': '#e5e7eb', 'fontSize': '1rem', 'fontWeight': '600'})
+                ], style={'display': 'flex', 'alignItems': 'center'})
+            ], className='header-status')
+        ], className='header-content')
+    ], className='header-bar'),
+    
     html.Div([
         html.Div([
-            html.P([
-                html.I(className="fas fa-shield-alt", style={"marginRight": "10px"}),
-                "SDN DDoS Defense System v2.0 | ",
-                html.Span(id="footer-time"),
-                " | Status: ",
-                html.Span("Operational", style={"color": "#00ff88", "fontWeight": "bold"})
-            ], style={"textAlign": "center", "color": "#fff", "margin": "0", "fontSize": "1rem"})
-        ])
-    ], style={
-        "background": "linear-gradient(135deg, #2c3e50 0%, #3498db 100%)",
-        "padding": "20px",
-        "marginTop": "30px"
-    })
-
-], style={
-    "backgroundColor": "#f0f2ff",
-    "minHeight": "100vh",
-    "margin": "0"
-})
-
-# Enhanced Callbacks
-@app.callback(
-    [Output("live-time", "children"),
-     Output("footer-time", "children")],
-    [Input("time-interval", "n_intervals")]
-)
-def update_time(n):
-    now = datetime.now()
-    time_str = now.strftime("%H:%M:%S")
-    date_str = now.strftime("%Y-%m-%d %H:%M:%S")
-    return time_str, date_str
-
-@app.callback(
-    [Output("total-requests", "children"),
-     Output("threats-detected", "children"),
-     Output("blocked-ips", "children"),
-     Output("avg-response", "children"),
-     Output("request-rate", "children"),
-     Output("threat-rate", "children"),
-     Output("block-rate", "children"),
-     Output("bandwidth", "children"),
-     Output("traffic-flow", "figure"),
-     Output("live-alerts", "children"),
-     Output("network-topology", "figure"),
-     Output("attack-patterns", "figure"),
-     Output("performance-metrics", "figure"),
-     Output("events-table", "children")],
-    [Input("update-interval", "n_intervals")]
-)
-def update_dashboard(n):
-    if not traffic_data:
-        # Enhanced empty state
-        empty_fig = create_empty_chart("Waiting for network data...")
-        return ("0", "0", "0", "0ms", "0 req/s", "0%", "0%", "0 MB/s",
-                empty_fig, create_no_alerts(), empty_fig, empty_fig, empty_fig, create_empty_table())
-
-    # Convert to DataFrame
-    df = pd.DataFrame(list(traffic_data))
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    
-    # Calculate enhanced metrics
-    total_requests = len(df)
-    threats = df[df.get('prediction', 'normal') != 'normal']
-    threats_detected = len(threats)
-    blocked_count = len(df[df.get('status', 'allowed') == 'blocked'].get('src_ip', pd.Series()).unique())
-    
-    # Calculate rates
-    recent_df = df[df['timestamp'] > (datetime.now() - timedelta(minutes=1))]
-    request_rate = f"{len(recent_df)} req/s"
-    threat_rate = f"{(threats_detected/total_requests*100):.1f}%" if total_requests > 0 else "0%"
-    block_rate = f"{(blocked_count/total_requests*100):.1f}%" if total_requests > 0 else "0%"
-    
-    avg_response = f"{df['response_time'].mean():.1f}ms" if 'response_time' in df.columns else "N/A"
-    bandwidth = f"{(df['byte_count'].sum()/(1024*1024)):.2f} MB/s" if 'byte_count' in df.columns else "0 MB/s"
-
-    # Create enhanced visualizations
-    traffic_fig = create_traffic_flow_chart(df)
-    alerts = create_live_alerts(list(alert_queue))
-    topology_fig = create_network_topology(df)
-    attack_fig = create_attack_patterns(threats)
-    performance_fig = create_performance_metrics(df)
-    events_table = create_enhanced_events_table(df)
-
-    return (str(total_requests), str(threats_detected), str(blocked_count), avg_response,
-            request_rate, threat_rate, block_rate, bandwidth,
-            traffic_fig, alerts, topology_fig, attack_fig, performance_fig, events_table)
-
-def create_empty_chart(title):
-    fig = go.Figure()
-    fig.add_annotation(
-        text=title,
-        xref="paper", yref="paper",
-        x=0.5, y=0.5,
-        showarrow=False,
-        font=dict(size=16, color="#666")
-    )
-    fig.update_layout(
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
-        xaxis=dict(visible=False),
-        yaxis=dict(visible=False)
-    )
-    return fig
-
-def create_traffic_flow_chart(df):
-    """Create an advanced traffic flow visualization"""
-    fig = make_subplots(
-        rows=2, cols=1,
-        subplot_titles=('Traffic Volume', 'Threat Detection'),
-        vertical_spacing=0.1,
-        row_heights=[0.7, 0.3]
-    )
-    
-    # Traffic volume over time
-    df_minute = df.set_index('timestamp').groupby([pd.Grouper(freq='30S'), 'prediction']).size().reset_index(name='count')
-    
-    colors = {'normal': '#4CAF50', 'ddos': '#FF5722', 'port_scan': '#FF9800', 'brute_force': '#9C27B0'}
-    
-    for prediction in df_minute['prediction'].unique():
-        subset = df_minute[df_minute['prediction'] == prediction]
-        fig.add_trace(
-            go.Scatter(
-                x=subset['timestamp'],
-                y=subset['count'],
-                mode='lines+markers',
-                name=prediction.replace('_', ' ').title(),
-                line=dict(width=3, color=colors.get(prediction, '#2196F3')),
-                marker=dict(size=8, symbol='circle'),
-                fill='tonexty' if prediction != 'normal' else None,
-                hovertemplate=f'<b>{prediction.title()}</b><br>Time: %{{x}}<br>Requests: %{{y}}<extra></extra>'
-            ),
-            row=1, col=1
-        )
-    
-    # Threat heatmap
-    threat_data = df[df['prediction'] != 'normal'].set_index('timestamp').groupby(pd.Grouper(freq='1Min')).size()
-    fig.add_trace(
-        go.Bar(
-            x=threat_data.index,
-            y=threat_data.values,
-            name='Threats per Minute',
-            marker_color='rgba(255, 87, 34, 0.7)',
-            hovertemplate='<b>Threats</b><br>Time: %{x}<br>Count: %{y}<extra></extra>'
-        ),
-        row=2, col=1
-    )
-    
-    fig.update_layout(
-        height=450,
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
-        font=dict(color='#333'),
-        showlegend=True,
-        legend=dict(x=1.02, y=1),
-        margin=dict(t=40, b=40, l=60, r=120)
-    )
-    
-    return fig
-
-def create_live_alerts(alerts):
-    """Create live alerts panel"""
-    if not alerts:
-        return html.Div([
             html.Div([
-                html.I(className="fas fa-check-circle", style={"fontSize": "3rem", "color": "#4CAF50", "marginBottom": "10px"}),
-                html.H4("All Clear", style={"color": "#4CAF50", "margin": "0"}),
-                html.P("No active security threats", style={"color": "#666", "marginTop": "5px"})
-            ], style={"textAlign": "center", "padding": "40px 20px"})
-        ])
-    
-    alert_components = []
-    for alert in reversed(list(alerts)[-10:]):  # Show last 10 alerts
-        severity_colors = {
-            'low': '#FFC107',
-            'medium': '#FF9800', 
-            'high': '#FF5722',
-            'critical': '#D32F2F'
-        }
+                html.Button([html.I(className="fas fa-pause"), 'Pause'], 
+                           id='pause-btn', n_clicks=0, className='btn-modern',
+                           style={'background': 'linear-gradient(135deg, #f59e0b, #d97706)', 'color': 'white'}),
+                
+                html.Button([html.I(className="fas fa-trash-alt"), 'Clear Data'], 
+                           id='clear-btn', n_clicks=0, className='btn-modern',
+                           style={'background': 'linear-gradient(135deg, #ef4444, #dc2626)', 'color': 'white'}),
+                
+                html.Div([
+                    html.Button([html.I(className="fas fa-chart-line"), 'All Traffic'], 
+                               id='filter-all-btn', n_clicks=0, className='btn-modern',
+                               style={'background': 'linear-gradient(135deg, #3b82f6, #2563eb)', 'color': 'white', 
+                                      'borderRadius': '10px 0 0 10px'}),
+                    html.Button([html.I(className="fas fa-exclamation-triangle"), 'Attacks Only'], 
+                               id='filter-attack-btn', n_clicks=0, className='btn-modern',
+                               style={'background': 'linear-gradient(135deg, #ec4899, #db2777)', 'color': 'white', 
+                                      'borderRadius': '0', 'marginLeft': '-1px'}),
+                    html.Button([html.I(className="fas fa-check-circle"), 'Normal Only'], 
+                               id='filter-normal-btn', n_clicks=0, className='btn-modern',
+                               style={'background': 'linear-gradient(135deg, #10b981, #059669)', 'color': 'white', 
+                                      'borderRadius': '0 10px 10px 0', 'marginLeft': '-1px'}),
+                ], className='filter-button-group'),
+            ], className='control-buttons')
+        ], className='control-panel'),
         
-        alert_components.append(
+        dcc.Store(id='pause-state', data=False),
+        dcc.Store(id='filter-state', data='all'),
+        dcc.Interval(id='fast-update', interval=UPDATE_INTERVAL, n_intervals=0),
+        dcc.Interval(id='clock-update', interval=1000, n_intervals=0),
+        
+        html.Div([
+            html.Div([
+                html.I(className="fas fa-network-wired metric-icon", style={'color': '#3b82f6'}),
+                html.H2(id='metric-total', children='0', className='metric-value'),
+                html.P('Total Requests', className='metric-label')
+            ], className='metric-card', style={'--card-color': '#3b82f6'}),
+            
+            html.Div([
+                html.I(className="fas fa-skull-crossbones metric-icon", style={'color': '#ef4444'}),
+                html.H2(id='metric-threats', children='0', className='metric-value'),
+                html.P('Threats Detected', className='metric-label')
+            ], className='metric-card', style={'--card-color': '#ef4444'}),
+            
+            html.Div([
+                html.I(className="fas fa-ban metric-icon", style={'color': '#f59e0b'}),
+                html.H2(id='metric-blocked', children='0', className='metric-value'),
+                html.P('Blocked IPs', className='metric-label')
+            ], className='metric-card', style={'--card-color': '#f59e0b'}),
+            
+            html.Div([
+                html.I(className="fas fa-tachometer-alt metric-icon", style={'color': '#10b981'}),
+                html.H2(id='metric-response', children='0ms', className='metric-value'),
+                html.P('Response Time', className='metric-label')
+            ], className='metric-card', style={'--card-color': '#10b981'}),
+        ], className='metrics-grid'),
+        
+        html.Div([
             html.Div([
                 html.Div([
-                    html.I(className="fas fa-exclamation-triangle", 
-                          style={"marginRight": "10px", "fontSize": "1.2rem"}),
-                    html.Strong(alert.get('type', 'Alert').upper(), 
-                               style={"marginRight": "10px"}),
-                    html.Span(alert.get('severity', 'medium').upper(),
-                             style={
-                                 "background": severity_colors.get(alert.get('severity', 'medium'), '#FF9800'),
-                                 "padding": "2px 8px",
-                                 "borderRadius": "12px",
-                                 "fontSize": "0.8rem",
-                                 "fontWeight": "bold"
-                             })
-                ], style={"marginBottom": "5px"}),
-                html.P(alert.get('message', ''), style={"margin": "0", "fontSize": "0.9rem"}),
-                html.Small(f"From: {alert.get('src_ip', 'Unknown')} | {alert.get('timestamp', '')}", 
-                          style={"opacity": "0.8"})
-            ], className="alert-item")
-        )
-    
-    return html.Div(alert_components)
+                    html.I(className="fas fa-chart-area"),
+                    html.Span('Real-Time Traffic Flow')
+                ], className='chart-title'),
+                dcc.Graph(id='traffic-chart', style={'height': '420px'}, config={'displayModeBar': False})
+            ], className='chart-card'),
+            
+            html.Div([
+                html.Div([
+                    html.I(className="fas fa-bell"),
+                    html.Span('Live Security Alerts')
+                ], className='chart-title'),
+                html.Div(id='alerts-panel', style={'maxHeight': '420px', 'overflowY': 'auto'})
+            ], className='chart-card'),
+        ], className='grid-65-35'),
+        
+        html.Div([
+            html.Div([
+                html.Div([
+                    html.I(className="fas fa-chart-pie"),
+                    html.Span('Attack Distribution')
+                ], className='chart-title'),
+                dcc.Graph(id='attack-dist', style={'height': '360px'}, config={'displayModeBar': False})
+            ], className='chart-card'),
+            
+            html.Div([
+                html.Div([
+                    html.I(className="fas fa-shield-alt"),
+                    html.Span('Blocked Ports Monitor')
+                ], className='chart-title'),
+                html.Div(id='blocked-ports-panel', style={'maxHeight': '360px', 'overflowY': 'auto'})
+            ], className='chart-card'),
+        ], className='grid-2col'),
+        
+        html.Div([
+            html.Div([
+                html.I(className="fas fa-crosshairs"),
+                html.Span('Top Threat Sources')
+            ], className='chart-title'),
+            dcc.Graph(id='top-sources', style={'height': '360px'}, config={'displayModeBar': False})
+        ], className='chart-card'),
+        
+        html.Div([
+            html.Div([
+                html.I(className="fas fa-table"),
+                html.Span('Network Security Events Log')
+            ], className='chart-title'),
+            html.Div(id='events-table')
+        ], className='chart-card'),
+        
+    ], className='main-container')
+], style={'minHeight': '100vh'})
 
-def create_no_alerts():
-    return html.Div([
-        html.I(className="fas fa-shield-alt", style={"fontSize": "3rem", "color": "#4CAF50"}),
-        html.H4("System Secure", style={"color": "#4CAF50", "marginTop": "10px"}),
-        html.P("No threats detected", style={"color": "#666"})
-    ], style={"textAlign": "center", "padding": "50px"})
+# ========== HELPER FUNCTIONS ==========
 
-def create_network_topology(df):
-    """Create network topology visualization"""
-    fig = go.Figure()
+def create_traffic_chart(df, filter_text="All Traffic"):
+    """Real-time traffic flow chart"""
+    fig = make_subplots(rows=1, cols=1)
     
-    if 'src_ip' not in df.columns:
-        return create_empty_chart("No network data available")
-    
-    # Get top source IPs and their threat levels
-    ip_stats = df.groupby('src_ip').agg({
-        'prediction': lambda x: (x != 'normal').sum(),
-        'packet_count': 'sum',
-        'byte_count': 'sum'
-    }).reset_index()
-    
-    ip_stats['threat_ratio'] = ip_stats['prediction'] / len(df[df['src_ip'].isin(ip_stats['src_ip'])])
-    top_ips = ip_stats.nlargest(15, 'packet_count')
-    
-    # Create network nodes
-    x_pos = np.random.uniform(0, 10, len(top_ips))
-    y_pos = np.random.uniform(0, 10, len(top_ips))
-    
-    # Color based on threat level
-    colors = ['#FF5722' if ratio > 0.3 else '#FF9800' if ratio > 0.1 else '#4CAF50' 
-              for ratio in top_ips['threat_ratio']]
-    
-    sizes = [max(20, min(60, count/100)) for count in top_ips['packet_count']]
-    
-    fig.add_trace(go.Scatter(
-        x=x_pos, y=y_pos,
-        mode='markers+text',
-        marker=dict(
-            size=sizes,
-            color=colors,
-            opacity=0.8,
-            line=dict(width=2, color='white')
-        ),
-        text=[ip.split('.')[-1] for ip in top_ips['src_ip']],
-        textposition='middle center',
-        textfont=dict(color='white', size=10, family='Arial Black'),
-        hovertemplate='<b>%{text}</b><br>Packets: %{customdata[0]}<br>Threats: %{customdata[1]}<extra></extra>',
-        customdata=list(zip(top_ips['packet_count'], top_ips['prediction'])),
-        name='Network Nodes'
-    ))
-    
-    # Add central node (firewall/controller)
-    fig.add_trace(go.Scatter(
-        x=[5], y=[5],
-        mode='markers+text',
-        marker=dict(size=80, color='#2196F3', opacity=0.9,
-                   line=dict(width=3, color='white')),
-        text=['SDN Controller'],
-        textposition='middle center',
-        textfont=dict(color='white', size=12, family='Arial Black'),
-        name='Controller'
-    ))
-    
-    fig.update_layout(
-        title="",
-        showlegend=False,
-        xaxis=dict(visible=False),
-        yaxis=dict(visible=False),
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
-        margin=dict(t=20, b=20, l=20, r=20)
-    )
-    
-    return fig
-
-def create_attack_patterns(threats_df):
-    """Create attack pattern analysis"""
-    if threats_df.empty:
-        return create_empty_chart("No attack patterns detected")
-    
-    # Attack types distribution
-    attack_counts = threats_df['prediction'].value_counts()
-    
-    # Create sunburst chart for attack patterns
-    fig = go.Figure(go.Sunburst(
-        labels=list(attack_counts.index) + ['Total Attacks'],
-        parents=['Total Attacks'] * len(attack_counts) + [''],
-        values=list(attack_counts.values) + [attack_counts.sum()],
-        branchvalues="total",
-        hovertemplate='<b>%{label}</b><br>Count: %{value}<br>Percentage: %{percentParent}<extra></extra>',
-        maxdepth=2,
-        insidetextorientation='radial'
-    ))
-    
-    fig.update_layout(
-        title="",
-        paper_bgcolor='rgba(0,0,0,0)',
-        font=dict(color='#333', size=12),
-        margin=dict(t=20, b=20, l=20, r=20)
-    )
-    
-    return fig
-
-def create_performance_metrics(df):
-    """Create system performance metrics"""
-    fig = make_subplots(
-        rows=1, cols=3,
-        subplot_titles=('Response Time', 'Bandwidth Usage', 'Connection Rate'),
-        specs=[[{"secondary_y": False}, {"secondary_y": False}, {"secondary_y": False}]]
-    )
-    
-    # Response time trend
-    if 'response_time' in df.columns:
-        time_data = df.set_index('timestamp')['response_time'].resample('1Min').mean()
-        fig.add_trace(
-            go.Scatter(
-                x=time_data.index,
-                y=time_data.values,
-                mode='lines',
-                name='Response Time',
-                line=dict(color='#2196F3', width=3),
-                fill='tozeroy',
-                fillcolor='rgba(33, 150, 243, 0.2)'
-            ), row=1, col=1
-        )
-    
-    # Bandwidth usage
-    if 'byte_count' in df.columns:
-        bandwidth_data = df.set_index('timestamp')['byte_count'].resample('1Min').sum() / (1024*1024)
-        fig.add_trace(
-            go.Bar(
-                x=bandwidth_data.index,
-                y=bandwidth_data.values,
-                name='Bandwidth (MB)',
-                marker_color='rgba(76, 175, 80, 0.7)'
-            ), row=1, col=2
-        )
-    
-    # Connection rate
-    conn_data = df.set_index('timestamp').resample('1Min').size()
-    fig.add_trace(
-        go.Scatter(
-            x=conn_data.index,
-            y=conn_data.values,
-            mode='lines+markers',
-            name='Connections/min',
-            line=dict(color='#FF9800', width=3),
-            marker=dict(size=6)
-        ), row=1, col=3
-    )
-    
-    fig.update_layout(
-        height=350,
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
-        font=dict(color='#333'),
-        showlegend=False,
-        margin=dict(t=40, b=40, l=60, r=60)
-    )
-    
-    return fig
-
-def create_enhanced_events_table(df):
-    """Create enhanced events table with better formatting"""
     if df.empty:
-        return html.Div("No events to display", style={"textAlign": "center", "padding": "20px", "color": "#666"})
+        fig.add_annotation(text="No data available", x=0.5, y=0.5, showarrow=False, 
+                          font=dict(size=16, color='#9ca3af'))
+        fig.update_layout(
+            template='plotly_dark',
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            margin=dict(l=40, r=40, t=40, b=40)
+        )
+        return fig
     
-    # Select and format relevant columns
-    display_columns = ['timestamp', 'src_ip', 'dst_ip', 'protocol', 'prediction', 'status', 'threat_level', 'confidence']
-    available_columns = [col for col in display_columns if col in df.columns]
+    df_time = df.set_index('timestamp').groupby([pd.Grouper(freq='5S'), 'prediction']).size().reset_index(name='count')
     
-    if not available_columns:
-        return html.Div("No data columns available", style={"textAlign": "center", "padding": "20px", "color": "#666"})
+    colors = {
+        'normal': '#10b981',
+        'ddos': '#ef4444',
+        'port_scan': '#f59e0b',
+        'brute_force': '#a855f7'
+    }
     
-    # Get recent events
-    recent_events = df.nlargest(50, 'timestamp')[available_columns].copy()
+    for pred in df_time['prediction'].unique():
+        subset = df_time[df_time['prediction'] == pred]
+        fig.add_trace(go.Scatter(
+            x=subset['timestamp'],
+            y=subset['count'],
+            mode='lines+markers',
+            name=pred.upper(),
+            line=dict(width=3, color=colors.get(pred, '#60a5fa')),
+            marker=dict(size=6),
+            fill='tonexty' if pred != 'normal' else None
+        ))
     
-    # Format timestamp
-    if 'timestamp' in recent_events.columns:
-        recent_events['timestamp'] = recent_events['timestamp'].dt.strftime('%H:%M:%S')
+    fig.update_layout(
+        title=dict(text=f"<b>{filter_text}</b>", font=dict(size=13, color='#9ca3af'), x=0.5, xanchor='center'),
+        xaxis_title='Time',
+        yaxis_title='Packet Count',
+        template='plotly_dark',
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(17, 24, 39, 0.5)',
+        hovermode='x unified',
+        margin=dict(l=40, r=40, t=50, b=40),
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, 
+                   font=dict(color='#e5e7eb')),
+        font=dict(color='#e5e7eb'),
+        xaxis=dict(gridcolor='rgba(99, 102, 241, 0.1)', color='#9ca3af'),
+        yaxis=dict(gridcolor='rgba(99, 102, 241, 0.1)', color='#9ca3af')
+    )
     
-    # Format confidence as percentage
-    if 'confidence' in recent_events.columns:
-        recent_events['confidence'] = (recent_events['confidence'] * 100).round(1).astype(str) + '%'
+    return fig
+
+def create_alerts_panel():
+    """Create modern live alerts panel"""
+    if not alert_queue:
+        return html.Div([
+            html.I(className="fas fa-shield-check", style={'fontSize': '4rem', 'color': '#10b981'}),
+            html.H4('System Secure', style={'color': '#10b981', 'marginTop': '16px', 'fontWeight': '700'}),
+            html.P('No active security threats detected', style={'color': '#9ca3af', 'marginTop': '8px'})
+        ], className='empty-state')
     
-    # Create conditional formatting rules
-    style_conditions = []
+    alerts_html = []
+    for alert in reversed(list(alert_queue)[-15:]):
+        severity_class = f"alert-{alert['severity']}" if alert['severity'] in ['high', 'critical'] else ''
+        icon_class = "fas fa-skull-crossbones" if alert['severity'] == 'critical' else "fas fa-exclamation-triangle"
+        
+        alerts_html.append(html.Div([
+            html.Div([
+                html.I(className=icon_class, style={'marginRight': '12px', 'fontSize': '1.3rem'}),
+                html.Strong(alert['type'].upper(), style={'fontSize': '1.1rem', 'letterSpacing': '0.5px'}),
+                html.Span(
+                    alert['severity'].upper(),
+                    className='badge badge-critical' if alert['severity'] in ['high', 'critical'] else 'badge',
+                    style={'marginLeft': '12px'}
+                )
+            ], style={'marginBottom': '10px', 'display': 'flex', 'alignItems': 'center'}),
+            html.P(alert['message'], style={'margin': '8px 0', 'fontSize': '0.95rem', 'lineHeight': '1.5'}),
+            html.Div([
+                html.I(className="fas fa-map-marker-alt", style={'marginRight': '6px', 'fontSize': '0.85rem'}),
+                html.Small(f"{alert['src_ip']}", style={'opacity': '0.9', 'marginRight': '16px'}),
+                html.I(className="fas fa-clock", style={'marginRight': '6px', 'fontSize': '0.85rem'}),
+                html.Small(alert['timestamp'][:19], style={'opacity': '0.9'})
+            ], style={'display': 'flex', 'alignItems': 'center', 'marginTop': '8px'})
+        ], className=severity_class))
     
-    # Threat level coloring
-    if 'threat_level' in recent_events.columns:
-        style_conditions.extend([
-            {
-                'if': {'filter_query': '{threat_level} = critical', 'column_id': 'threat_level'},
-                'backgroundColor': '#ffebee',
-                'color': '#c62828',
-                'fontWeight': 'bold'
-            },
-            {
-                'if': {'filter_query': '{threat_level} = high', 'column_id': 'threat_level'},
-                'backgroundColor': '#fff3e0',
-                'color': '#ef6c00',
-                'fontWeight': 'bold'
-            },
-            {
-                'if': {'filter_query': '{threat_level} = medium', 'column_id': 'threat_level'},
-                'backgroundColor': '#fffde7',
-                'color': '#f9a825'
-            }
-        ])
+    return html.Div(alerts_html)
+
+def create_blocked_ports_panel(df):
+    """Create modern blocked ports monitoring panel"""
+    port_blocked = df[df['status'] == 'port_blocked']
     
-    # Prediction coloring
-    if 'prediction' in recent_events.columns:
-        style_conditions.extend([
-            {
-                'if': {'filter_query': '{prediction} != normal', 'column_id': 'prediction'},
-                'backgroundColor': '#fce4ec',
-                'color': '#ad1457',
-                'fontWeight': 'bold'
-            }
-        ])
+    if port_blocked.empty:
+        return html.Div([
+            html.I(className="fas fa-lock-open", style={'fontSize': '4rem', 'color': '#10b981'}),
+            html.H4('All Ports Open', style={'color': '#10b981', 'marginTop': '16px', 'fontWeight': '700'}),
+            html.P('No ports are currently blocked', style={'color': '#9ca3af', 'marginTop': '8px'})
+        ], className='empty-state')
     
-    # Status coloring
-    if 'status' in recent_events.columns:
-        style_conditions.extend([
-            {
-                'if': {'filter_query': '{status} = blocked', 'column_id': 'status'},
-                'backgroundColor': '#ffebee',
-                'color': '#c62828',
-                'fontWeight': 'bold'
-            },
-            {
-                'if': {'filter_query': '{status} = allowed', 'column_id': 'status'},
-                'backgroundColor': '#e8f5e8',
-                'color': '#2e7d32'
-            }
-        ])
+    port_stats = port_blocked.groupby('dst_port').agg({
+        'src_ip': 'count',
+        'timestamp': 'max'
+    }).reset_index()
+    port_stats.columns = ['port', 'attack_count', 'last_attack']
+    port_stats = port_stats.sort_values('attack_count', ascending=False)
+    
+    port_items = []
+    for _, row in port_stats.head(10).iterrows():
+        port_items.append(html.Div([
+            html.Div([
+                html.Div([
+                    html.I(className="fas fa-shield-alt", style={'fontSize': '2rem', 'color': '#ef4444', 'marginRight': '16px'}),
+                    html.Div([
+                        html.Strong(f"Port {row['port']}", style={'fontSize': '1.4rem', 'color': '#e5e7eb', 'display': 'block'}),
+                        html.Small(f"{row['attack_count']} attack attempts", style={'color': '#9ca3af', 'fontSize': '0.9rem'})
+                    ])
+                ], style={'display': 'flex', 'alignItems': 'center', 'marginBottom': '12px'}),
+                html.Div([
+                    html.Span('BLOCKED', className='badge badge-blocked', style={'marginRight': '12px'}),
+                    html.Span([
+                        html.I(className="fas fa-clock", style={'marginRight': '6px'}),
+                        f"Last: {row['last_attack'].strftime('%H:%M:%S') if hasattr(row['last_attack'], 'strftime') else str(row['last_attack'])[:8]}"
+                    ], style={'color': '#9ca3af', 'fontSize': '0.9rem'})
+                ], style={'display': 'flex', 'alignItems': 'center'})
+            ])
+        ], className='blocked-port-card'))
+    
+    return html.Div(port_items)
+
+def create_attack_distribution(df):
+    """Attack types pie chart"""
+    threats = df[df['prediction'] != 'normal']
+    
+    if threats.empty:
+        fig = go.Figure()
+        fig.add_annotation(text="No Threats Detected", x=0.5, y=0.5, showarrow=False, 
+                          font=dict(size=16, color='#9ca3af'))
+        fig.update_layout(
+            template='plotly_dark',
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            margin=dict(l=20, r=20, t=20, b=20)
+        )
+        return fig
+    
+    attack_counts = threats['prediction'].value_counts()
+    
+    fig = go.Figure(data=[go.Pie(
+        labels=attack_counts.index,
+        values=attack_counts.values,
+        hole=0.4,
+        marker=dict(colors=['#ef4444', '#f59e0b', '#a855f7', '#ec4899']),
+        textinfo='label+percent',
+        textfont=dict(size=12, color='white')
+    )])
+    
+    fig.update_layout(
+        template='plotly_dark',
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        margin=dict(l=20, r=20, t=20, b=20),
+        showlegend=True,
+        legend=dict(orientation='h', yanchor='bottom', y=-0.2, font=dict(color='#e5e7eb')),
+        font=dict(color='#e5e7eb')
+    )
+    
+    return fig
+
+def create_top_sources(df):
+    """Top threat sources bar chart"""
+    threats = df[df['prediction'] != 'normal']
+    
+    if threats.empty:
+        fig = go.Figure()
+        fig.add_annotation(text="No Threat Sources", x=0.5, y=0.5, showarrow=False, 
+                          font=dict(size=16, color='#9ca3af'))
+        fig.update_layout(
+            template='plotly_dark',
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            margin=dict(l=20, r=20, t=20, b=20)
+        )
+        return fig
+    
+    top_ips = threats['src_ip'].value_counts().head(10)
+    
+    fig = go.Figure(data=[go.Bar(
+        x=top_ips.values,
+        y=top_ips.index,
+        orientation='h',
+        marker=dict(
+            color='#ef4444',
+            line=dict(color='#dc2626', width=2)
+        ),
+        text=top_ips.values,
+        textposition='auto',
+        textfont=dict(color='white')
+    )])
+    
+    fig.update_layout(
+        xaxis_title='Threat Count',
+        yaxis_title='Source IP',
+        template='plotly_dark',
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(17, 24, 39, 0.5)',
+        margin=dict(l=150, r=40, t=20, b=40),
+        font=dict(color='#e5e7eb'),
+        xaxis=dict(gridcolor='rgba(99, 102, 241, 0.1)', color='#9ca3af'),
+        yaxis=dict(gridcolor='rgba(99, 102, 241, 0.1)', color='#9ca3af')
+    )
+    
+    return fig
+
+def create_events_table(df):
+    """Recent events table"""
+    if df.empty:
+        return html.Div("No events to display", className='empty-state')
+    
+    recent = df.nlargest(50, 'timestamp').copy()
+    recent['timestamp'] = recent['timestamp'].dt.strftime('%H:%M:%S')
+    
+    columns = ['timestamp', 'src_ip', 'dst_ip', 'src_port', 'dst_port', 'protocol', 
+               'prediction', 'status', 'threat_level', 'packet_count', 'byte_count']
+    
+    available_cols = [c for c in columns if c in recent.columns]
+    display_df = recent[available_cols]
+    
+    style_conditions = [
+        {
+            'if': {'filter_query': '{prediction} != "normal"', 'column_id': 'prediction'},
+            'backgroundColor': 'rgba(239, 68, 68, 0.2)',
+            'color': '#fca5a5',
+            'fontWeight': 'bold'
+        },
+        {
+            'if': {'filter_query': '{status} = "blocked"', 'column_id': 'status'},
+            'backgroundColor': 'rgba(239, 68, 68, 0.3)',
+            'color': '#f87171',
+            'fontWeight': 'bold'
+        },
+        {
+            'if': {'filter_query': '{threat_level} = "critical"', 'column_id': 'threat_level'},
+            'backgroundColor': '#dc2626',
+            'color': 'white',
+            'fontWeight': 'bold'
+        },
+        {
+            'if': {'filter_query': '{threat_level} = "high"', 'column_id': 'threat_level'},
+            'backgroundColor': '#f59e0b',
+            'color': 'white'
+        }
+    ]
     
     table = dash_table.DataTable(
-        data=recent_events.to_dict('records'),
-        columns=[{
-            'name': col.replace('_', ' ').title(),
-            'id': col,
-            'type': 'text'
-        } for col in available_columns],
-        
+        data=display_df.to_dict('records'),
+        columns=[{'name': c.replace('_', ' ').title(), 'id': c} for c in available_cols],
         style_cell={
             'textAlign': 'center',
-            'padding': '15px 12px',
-            'fontFamily': 'Poppins, sans-serif',
-            'fontSize': '0.9rem',
-            'border': '1px solid #e0e0e0',
-            'whiteSpace': 'normal',
-            'height': 'auto'
+            'padding': '12px',
+            'fontSize': '0.875rem',
+            'fontFamily': 'Inter, sans-serif',
+            'backgroundColor': 'rgba(17, 24, 39, 0.8)',
+            'color': '#e5e7eb',
+            'border': '1px solid rgba(99, 102, 241, 0.2)'
         },
-        
         style_header={
-            'backgroundColor': 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+            'backgroundColor': 'rgba(59, 130, 246, 0.8)',
             'color': 'white',
             'fontWeight': 'bold',
-            'fontSize': '1rem',
-            'padding': '15px 12px',
-            'border': '1px solid #5a67d8'
+            'fontSize': '0.9rem',
+            'border': '1px solid rgba(99, 102, 241, 0.3)'
         },
-        
-        style_data={
-            'backgroundColor': '#fafafa',
-            'color': '#333'
-        },
-        
         style_data_conditional=style_conditions,
-        
-        page_size=20,
-        sort_action="native",
-        filter_action="native",
-        
-        tooltip_data=[
-            {
-                column: {'value': str(value), 'type': 'markdown'}
-                for column, value in row.items()
-            } for row in recent_events.to_dict('records')
-        ],
-        
-        tooltip_duration=None,
-        
-        style_table={
-            'overflowX': 'auto',
-            'border': '1px solid #e0e0e0',
-            'borderRadius': '10px',
-            'boxShadow': '0 4px 6px rgba(0,0,0,0.1)'
-        }
+        page_size=15,
+        sort_action='native',
+        filter_action='native',
+        style_table={'overflowX': 'auto'}
     )
     
     return table
 
-def create_empty_table():
-    return html.Div([
-        html.I(className="fas fa-table", style={"fontSize": "3rem", "color": "#ccc", "marginBottom": "10px"}),
-        html.H4("No Events", style={"color": "#666"}),
-        html.P("Waiting for network traffic data", style={"color": "#999"})
-    ], style={"textAlign": "center", "padding": "50px"})
+# ========== CALLBACKS ==========
 
-if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=8052)
+@app.callback(
+    [Output('metric-total', 'children'),
+     Output('metric-threats', 'children'),
+     Output('metric-blocked', 'children'),
+     Output('metric-response', 'children'),
+     Output('traffic-chart', 'figure'),
+     Output('alerts-panel', 'children'),
+     Output('attack-dist', 'figure'),
+     Output('top-sources', 'figure'),
+     Output('blocked-ports-panel', 'children'),
+     Output('events-table', 'children')],
+    [Input('fast-update', 'n_intervals')],
+    [State('pause-state', 'data'),
+     State('filter-state', 'data')]
+)
+def update_dashboard(n, paused, filter_mode):
+    if paused:
+        raise dash.exceptions.PreventUpdate
+    
+    if not traffic_events:
+        empty_fig = go.Figure()
+        empty_fig.update_layout(
+            template='plotly_dark',
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)'
+        )
+        return ('0', '0', '0', '0ms', empty_fig, 
+                html.Div('No alerts', className='empty-state'), 
+                empty_fig, empty_fig, 
+                html.Div('No blocked ports', className='empty-state'), 
+                html.Div())
+    
+    df = pd.DataFrame(list(traffic_events))
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df_original = df.copy()
+    
+    if filter_mode == 'attack':
+        df = df[df['prediction'] != 'normal']
+        filter_text = "🚨 Showing Attacks Only"
+        if df.empty:
+            empty_msg = html.Div([
+                html.I(className="fas fa-shield-alt", style={'fontSize': '3rem', 'color': '#10b981'}),
+                html.H4('No Attacks Detected', style={'color': '#10b981', 'marginTop': '15px'}),
+                html.P('System is secure - All traffic is normal', style={'color': '#9ca3af'})
+            ], className='empty-state')
+            empty_fig = go.Figure()
+            empty_fig.update_layout(template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+            return ('0', '0', '0', '0ms', empty_fig, empty_msg, empty_fig, empty_fig, 
+                    html.Div('No blocked ports', className='empty-state'), empty_msg)
+    elif filter_mode == 'normal':
+        df = df[df['prediction'] == 'normal']
+        filter_text = "✅ Showing Normal Traffic Only"
+        if df.empty:
+            empty_msg = html.Div([
+                html.I(className="fas fa-exclamation-triangle", style={'fontSize': '3rem', 'color': '#f59e0b'}),
+                html.H4('No Normal Traffic', style={'color': '#f59e0b', 'marginTop': '15px'}),
+                html.P('All traffic is being flagged as threats', style={'color': '#9ca3af'})
+            ], className='empty-state')
+            empty_fig = go.Figure()
+            empty_fig.update_layout(template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+            return ('0', '0', '0', '0ms', empty_fig, 
+                    html.Div('All traffic blocked', className='empty-state'), 
+                    empty_fig, empty_fig, 
+                    html.Div('No blocked ports', className='empty-state'), empty_msg)
+    else:
+        filter_text = "📊 Showing All Traffic"
+    
+    total = len(df_original)
+    threats = system_stats['threats_detected']
+    blocked = len(blocked_ips_set)
+    response = f"{system_stats['avg_response_time']:.1f}ms"
+    
+    traffic_fig = create_traffic_chart(df, filter_text)
+    alerts_html = create_alerts_panel()
+    attack_fig = create_attack_distribution(df_original)
+    top_fig = create_top_sources(df_original)
+    blocked_ports_html = create_blocked_ports_panel(df_original)
+    table = create_events_table(df)
+    
+    return (str(total), str(threats), str(blocked), response, 
+            traffic_fig, alerts_html, attack_fig, top_fig, 
+            blocked_ports_html, table)
+
+@app.callback(
+    Output('pause-state', 'data'),
+    [Input('pause-btn', 'n_clicks')],
+    [State('pause-state', 'data')]
+)
+def toggle_pause(n, current):
+    global is_paused
+    if n:
+        is_paused = not current
+        return not current
+    return False
+
+@app.callback(
+    Output('filter-state', 'data'),
+    [Input('filter-all-btn', 'n_clicks'),
+     Input('filter-attack-btn', 'n_clicks'),
+     Input('filter-normal-btn', 'n_clicks')],
+    [State('filter-state', 'data')]
+)
+def update_filter(all_clicks, attack_clicks, normal_clicks, current):
+    ctx = dash.callback_context
+    
+    if not ctx.triggered:
+        return 'all'
+    
+    button_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    if button_id == 'filter-all-btn':
+        return 'all'
+    elif button_id == 'filter-attack-btn':
+        return 'attack'
+    elif button_id == 'filter-normal-btn':
+        return 'normal'
+    
+    return current
+
+@app.callback(
+    [Output('filter-all-btn', 'style'),
+     Output('filter-attack-btn', 'style'),
+     Output('filter-normal-btn', 'style')],
+    [Input('filter-state', 'data')]
+)
+def update_filter_buttons(filter_mode):
+    base_left = {
+        'background': 'linear-gradient(135deg, #3b82f6, #2563eb)',
+        'color': 'white',
+        'borderRadius': '10px 0 0 10px',
+        'opacity': '0.6'
+    }
+    base_mid = {
+        'background': 'linear-gradient(135deg, #ec4899, #db2777)',
+        'color': 'white',
+        'borderRadius': '0',
+        'marginLeft': '-1px',
+        'opacity': '0.6'
+    }
+    base_right = {
+        'background': 'linear-gradient(135deg, #10b981, #059669)',
+        'color': 'white',
+        'borderRadius': '0 10px 10px 0',
+        'marginLeft': '-1px',
+        'opacity': '0.6'
+    }
+    
+    if filter_mode == 'all':
+        base_left['opacity'] = '1'
+        base_left['boxShadow'] = '0 0 20px rgba(59, 130, 246, 0.5)'
+    elif filter_mode == 'attack':
+        base_mid['opacity'] = '1'
+        base_mid['boxShadow'] = '0 0 20px rgba(236, 72, 153, 0.5)'
+    elif filter_mode == 'normal':
+        base_right['opacity'] = '1'
+        base_right['boxShadow'] = '0 0 20px rgba(16, 185, 129, 0.5)'
+    
+    return base_left, base_mid, base_right
+
+@app.callback(
+    Output('clear-btn', 'n_clicks'),
+    [Input('clear-btn', 'n_clicks')]
+)
+def clear_data(n):
+    if n:
+        traffic_events.clear()
+        alert_queue.clear()
+        blocked_ips_set.clear()
+        system_stats.update({
+            'total_requests': 0,
+            'threats_detected': 0,
+            'blocked_count': 0
+        })
+    return 0
+
+@app.callback(
+    [Output('connection-status', 'children'),
+     Output('live-clock', 'children')],
+    [Input('clock-update', 'n_intervals')]
+)
+def update_status(n):
+    status_text = f"Status: {system_stats['connection_status']}"
+    clock_text = datetime.now().strftime('%H:%M:%S')
+    return status_text, clock_text
+
+# ========== RUN APP ==========
+if __name__ == '__main__':
+    print("🚀 Starting Modern Real-Time Dashboard...")
+    print(f"📡 Listening to ZMQ: {ZMQ_ADDRESS}")
+    print(f"🌐 Dashboard: http://localhost:8054")
+    app.run(debug=True, host='localhost', port=8054)
