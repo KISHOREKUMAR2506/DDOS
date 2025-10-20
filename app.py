@@ -836,42 +836,89 @@ def create_blocked_ports_panel(df):
     return html.Div(port_items)
 
 def create_attack_distribution(df):
-    """Attack types pie chart"""
-    threats = df[df['prediction'] != 'normal']
-    
-    if threats.empty:
+    """Combined traffic pie chart: Normal vs DDoS vs Other threats vs Blocked ports."""
+    # Defensive checks
+    total = 0
+    normal_count = 0
+    ddos_count = 0
+    other_count = 0
+    blocked_ports_count = 0
+
+    if df is None or df.empty:
         fig = go.Figure()
-        fig.add_annotation(text="No Threats Detected", x=0.5, y=0.5, showarrow=False, 
+        fig.add_annotation(text="No data available", x=0.5, y=0.5, showarrow=False,
                           font=dict(size=16, color='#9ca3af'))
-        fig.update_layout(
-            template='plotly_dark',
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)',
-            margin=dict(l=20, r=20, t=20, b=20)
-        )
+        fig.update_layout(template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
         return fig
-    
-    attack_counts = threats['prediction'].value_counts()
-    
+
+    total = len(df)
+
+    # Predictions
+    if 'prediction' in df.columns:
+        preds = df['prediction'].astype(str).fillna('unknown')
+        normal_count = int((preds == 'normal').sum())
+        # treat any prediction containing 'ddos' as ddos
+        ddos_count = int(preds.str.contains('ddos', case=False, na=False).sum())
+        other_count = int(((preds != 'normal') & (~preds.str.contains('ddos', case=False, na=False))).sum())
+
+    # Blocked ports as unique blocked dst_port values
+    if 'status' in df.columns and 'dst_port' in df.columns:
+        blocked_mask = df['status'].astype(str).str.contains('blocked|port_blocked', case=False, na=False)
+        try:
+            blocked_ports_count = int(df.loc[blocked_mask, 'dst_port'].dropna().nunique())
+        except Exception:
+            # fallback to count of blocked events
+            blocked_ports_count = int(blocked_mask.sum())
+
+    # Build slices, omit zeros for clarity
+    labels = []
+    values = []
+    colors = []
+
+    if normal_count > 0:
+        labels.append('Normal Traffic')
+        values.append(normal_count)
+        colors.append('#10b981')
+    if ddos_count > 0:
+        labels.append('DDoS Traffic')
+        values.append(ddos_count)
+        colors.append('#ef4444')
+    if other_count > 0:
+        labels.append('Other Threats')
+        values.append(other_count)
+        colors.append('#f59e0b')
+    if blocked_ports_count > 0:
+        labels.append('Blocked Ports (unique)')
+        values.append(blocked_ports_count)
+        colors.append('#6b21a8')
+
+    # If nothing to show (edge case), show a no-data figure
+    if not values:
+        fig = go.Figure()
+        fig.add_annotation(text="No meaningful traffic breakdown", x=0.5, y=0.5, showarrow=False,
+                          font=dict(size=16, color='#9ca3af'))
+        fig.update_layout(template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+        return fig
+
     fig = go.Figure(data=[go.Pie(
-        labels=attack_counts.index,
-        values=attack_counts.values,
+        labels=labels,
+        values=values,
         hole=0.4,
-        marker=dict(colors=['#ef4444', '#f59e0b', '#a855f7', '#ec4899']),
+        marker=dict(colors=colors, line=dict(color='rgba(0,0,0,0.2)', width=1)),
         textinfo='label+percent',
         textfont=dict(size=12, color='white')
     )])
-    
+
     fig.update_layout(
         template='plotly_dark',
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='rgba(0,0,0,0)',
         margin=dict(l=20, r=20, t=20, b=20),
         showlegend=True,
-        legend=dict(orientation='h', yanchor='bottom', y=-0.2, font=dict(color='#e5e7eb')),
+        legend=dict(orientation='h', yanchor='bottom', y=-0.15, font=dict(color='#e5e7eb')),
         font=dict(color='#e5e7eb')
     )
-    
+
     return fig
 
 def create_top_sources(df):
